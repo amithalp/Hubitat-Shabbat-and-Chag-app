@@ -1,0 +1,322 @@
+/**
+ * Shabbat and Holiday Schedules
+ *
+ * Author: @amithalp
+ * Based on original by @dannyzen / danielbarak
+ * Simplified to switch-first approach: app controls a ShabbatActive virtual switch only.
+ */
+
+definition(
+    name: "Shabbat and Holiday Schedules",
+    namespace: "ShabbatHolidaySchedules",
+    author: "@amithalp",
+    description: "Schedules a ShabbatActive switch ON at candle lighting and OFF at Havdalah using Hebcal. Optional dashboard preview.",
+    category: "My Apps",
+    iconUrl: "http://upload.wikimedia.org/wikipedia/commons/thumb/4/49/Star_of_David.svg/200px-Star_of-David.svg.png",
+    iconX2Url: "http://upload.wikimedia.org/wikipedia/commons/thumb/4/49/Star_of_David.svg/200px-Star_of-David.svg.png",
+    iconX3Url: "http://upload.wikimedia.org/wikipedia/commons/thumb/4/49/Star_of_David.svg/200px-Star_of-David.svg.png",
+    pausable: true
+)
+
+preferences {
+    page(name: "mainPage")
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "", install: true, uninstall: true) {
+        section("What this app does") {
+            paragraph "• Creates a virtual switch named <b>ShabbatActive</b>."
+            paragraph "• Turns it <b>ON</b> at candle lighting and <b>OFF</b> at Havdalah (Hebcal)."
+            paragraph "• <b>Optional:</b> writes upcoming times to a Notification Tile. <b> NOTE </b>- You should create a virtual device using the Notification Tile enhanced driver."
+            paragraph "• <b>Note:</b> you can view the next ON and OFF schedules at the app setting by clicking the app settings icon."
+        }
+
+        section("How many days ahead to fetch Shabbat/Chag times?. Will be used mainly for display on the Notification tile if selected below") {
+            input "daysAhead", "number", title: "Days ahead", defaultValue: 30, required: true
+        }
+        section("Polling Frequency (hours)") {
+            input "pollFrequencyHours", "number", title: "Refresh schedules every", defaultValue: 24, required: true
+        }
+        section("Havdalah Offset (minutes after sunset)") {
+            input "havdalahOffset", "number", title: "Havdalah offset", defaultValue: 50, required: true
+        }
+        section("Optional: Notification Tile. Note- only up to 1024 chars will be displayed") {
+            paragraph "Create a virtual device using the <b>Notification Tile – enhanced</b> driver, then select it here."
+            input "notificationDevice", "capability.notification", title: "Notification Tile – enhanced", required: false
+        }
+        section("Manual Refresh") {
+            input "manualRefreshButton", "button", title: "Refresh Schedules Now", submitOnChange: true
+        }
+    }
+}
+
+import groovy.time.TimeCategory
+
+/************ App lifecycle ************/
+
+def installed() {
+    log.debug "Installed with settings: ${settings}"
+    createShabbatActiveSwitchIfMissing()
+    initialize()
+}
+
+def updated() {
+    log.debug "Updated with settings: ${settings}"
+    unsubscribe()
+    unschedule()
+    createShabbatActiveSwitchIfMissing()
+    
+    initialize()
+}
+
+def initialize() {
+    unschedule()
+
+    def pollFrequency = (pollFrequencyHours ?: 24) as int
+    if (pollFrequency < 1) pollFrequency = 1
+
+    // Seed one-time schedules
+    poll()
+
+    // Build a valid cron for "every N hours"
+    String cron
+    if (pollFrequency == 24) {
+        cron = "0 0 0 * * ?"            // once a day at 00:00
+    } else if (pollFrequency < 24) {
+        cron = "0 0 */${pollFrequency} * * ?" // every N hours
+    } else {
+        int days = Math.ceil(pollFrequency / 24.0) as int
+        cron = "0 0 0 */${days} * ?"    // every X days, midnight
+    }
+    schedule(cron, poll)
+
+    def sw = getActiveSwitch()
+    if (sw) subscribe(sw, "switch", handler)
+}
+
+def handler(evt) {
+    log.info "${evt.device} ${evt.value}"
+}
+
+/**
+ * This method is called automatically by the Hubitat platform when a button
+ * is pressed on the app's preferences page.
+ */
+def appButtonHandler(btnName) {
+    if (btnName == "manualRefreshButton") {
+        log.info "Manual refresh button pushed. Polling immediately."
+        poll()
+    }
+}
+
+
+/************ Core workflow ************/
+
+def poll() {
+    log.debug "Polling…"
+    fetchAndScheduleHebcal()
+}
+
+/************ Hebcal fetch + schedule ************/
+
+private fetchAndScheduleHebcal() {
+    if (!location?.latitude || !location?.longitude || !location?.timeZone) {
+        log.error "Hub location or timezone not set. Please set Location on the hub."
+        return
+    }
+
+    def today = new Date()
+    def tz = location.timeZone
+    def startDate = today.format('yyyy-MM-dd', tz)
+    def daysToFetch = (daysAhead ?: 30) as int
+    def endDate = use(TimeCategory) { (today + daysToFetch.days).format('yyyy-MM-dd', tz) }
+
+    def urlRequest = "https://www.hebcal.com/hebcal/?" +
+        "v=1&cfg=json&c=on&mf=off&nh=off&nx=off" +
+        "&start=${startDate}&end=${endDate}" +
+        "&latitude=${location.latitude}" +
+        "&longitude=${location.longitude}" +
+        "&tzid=${tz.ID}" +
+        "&m=${havdalahOffset}"
+
+    log.debug "Fetching Hebcal events from ${startDate} to ${endDate}"
+    log.debug "Request URL: ${urlRequest}"
+
+    try {
+        httpGet(urlRequest) { resp ->
+            if (resp?.status != 200 || !resp?.data?.items) {
+                log.warn "Hebcal fetch returned status ${resp?.status ?: 'n/a'} or empty payload. Keeping existing schedules."
+                return
+            }
+
+            def events = []
+            resp.data.items.each { item ->
+                if (item?.category in ["candles", "havdalah"]) {
+                    def when = toDateTime(item.date) // tz-aware
+                    events << [
+                        datetime: when,
+                        date    : when.format("EEE dd/MM HH:mm", tz),
+                        type    : item.category,
+                        label   : item.title
+                    ]
+                }
+            }
+
+            // Sort and persist for preview
+            events.sort { a, b -> a.datetime <=> b.datetime }
+            state.upcomingEvents = events
+
+            // Find ONLY the next upcoming ON and OFF
+            def now = new Date()
+            def nextOn  = events.find { it.type == "candles"  && it.datetime.after(now) }
+            def nextOff = events.find { it.type == "havdalah" && it.datetime.after(now) }
+
+            // Replace prior one-time jobs only after we have targets
+            unschedule("shabbatOn")
+            unschedule("shabbatOff")
+
+            if (nextOn) {
+                runOnce(nextOn.datetime, 'shabbatOn')
+                log.info "Next ON  at ${nextOn.datetime} (local ${nextOn.datetime.format('EEE dd/MM HH:mm', tz)})"
+            } else {
+                log.warn "No upcoming candle-lighting found in window."
+            }
+
+            if (nextOff) {
+                runOnce(nextOff.datetime, 'shabbatOff')
+                log.info "Next OFF at ${nextOff.datetime} (local ${nextOff.datetime.format('EEE dd/MM HH:mm', tz)})"
+            } else {
+                log.warn "No upcoming havdalah found in window."
+            }
+
+            updateShabbatPreview()
+        }
+    } catch (e) {
+        log.warn "Hebcal fetch failed: ${e.message}. Keeping existing schedules."
+    }
+}
+
+/************ Switch actions ************/
+
+def shabbatOn() {
+    def sw = getActiveSwitch()
+    if (sw) {
+        log.info "Shabbat/Chag starting → turning ${sw.displayName} ON"
+        sw.on()
+    } else {
+        log.warn "No ShabbatActive switch available."
+    }
+    // Reschedule the next pair after this one fires
+    runIn(5, 'poll')
+}
+
+def shabbatOff() {
+    def sw = getActiveSwitch()
+    if (sw) {
+        log.info "Shabbat/Chag ending → turning ${sw.displayName} OFF"
+        sw.off()
+    } else {
+        log.warn "No ShabbatActive switch available."
+    }
+    // Reschedule the next pair after this one fires
+    runIn(5, 'poll')
+}
+
+/************ Dashboard preview ************/
+
+def updateShabbatPreview() {
+    if (!notificationDevice) {
+        log.debug "No notificationDevice selected; skipping preview."
+        return
+    }
+    def events = state.upcomingEvents ?: []
+    if (!events || events.isEmpty()) {
+        log.warn "No upcoming events to show."
+        notificationDevice.sendEvent(name:"last5", value:"<span class='last5'></span>")
+        return
+    }
+
+    // Hard limits
+    final int MAX_LEN = 1024
+    final int SOFT_CAP = 1000   // leave headroom for wrappers/“+N more…”
+    final int MAX_LABEL_LEN = 80
+
+    // RTL auto-detect: if any label/date has Hebrew chars, switch to RTL block
+    boolean looksRTL = events.any { e ->
+        def s = (e?.label?.toString() ?: "") + " " + (e?.date?.toString() ?: "")
+        return s =~ /[\u0590-\u05FF]/
+    }
+    def align   = looksRTL ? "right" : "left"
+    def dir     = looksRTL ? "rtl"   : "ltr"
+
+    def header = "<span style='color:orange;font-weight:600;'>🕯️ Upcoming Shabbat and Chag Times</span><br/>"
+
+    StringBuilder body = new StringBuilder()
+    int added = 0
+
+    events.each { e ->
+        def icon = (e?.type == "candles") ? "🕯️" : "✨"
+
+        // Clean and trim label
+        def clean = (e?.label?.toString() ?: "")
+            .replaceAll(/: \d{1,2}:\d{2}$/, '')   // drop trailing HH:mm in title
+            .replaceAll(/\s*\(.*?\)\s*$/, '')     // drop trailing parentheses
+        if (clean.length() > MAX_LABEL_LEN) clean = clean.substring(0, MAX_LABEL_LEN - 1) + "…"
+
+        def dateStr = e?.date?.toString() ?: ""
+        def line = "<span style='display:inline-block;width:22px;'>${icon}</span>${dateStr} - ${clean}<br/>"
+
+        // Predict length with wrapper
+        def test = "<span class=\"last5\" style=\"display:block;text-align:${align};direction:${dir};line-height:1.35;\">${header}${body}${line}</span>"
+        if (test.length() > SOFT_CAP) return  // stop adding lines
+        body.append(line); added++
+    }
+
+    int remaining = Math.max(events.size() - added, 0)
+    if (remaining > 0) {
+        def more = "<span style='opacity:.8;'>+${remaining} more…</span>"
+        def testMore = "<span class=\"last5\" style=\"display:block;text-align:${align};direction:${dir};line-height:1.35;\">${header}${body}${more}</span>"
+        if (testMore.length() <= MAX_LEN) {
+            body.append(more)
+        } else {
+            // if even the “more…” doesn’t fit, skip it—better safe than truncating mid-HTML
+            log.debug "Skipping +${remaining} more… to stay within ${MAX_LEN} chars."
+        }
+    }
+
+    def html = "<span class=\"last5\" style=\"display:block;text-align:${align};direction:${dir};line-height:1.35;\">${header}${body}</span>"
+    if (html.length() > MAX_LEN) {
+        // ultra-rare fallback: hard trim at MAX_LEN to avoid rejection
+        html = html.substring(0, MAX_LEN)
+    }
+    log.debug "Preview length: ${html.length()}"
+    notificationDevice.sendEvent(name:"last5", value: html)
+}
+
+
+/************ Child device management ************/
+
+private createShabbatActiveSwitchIfMissing() {
+    def dni = "shabbatactive-virtual-switch"
+    def existing = getChildDevice(dni)
+    if (!existing) {
+        log.info "Creating ShabbatActive virtual switch…"
+        try {
+            def child = addChildDevice(
+                "hubitat",         // namespace
+                "Virtual Switch",  // typeName
+                dni,
+                [label: "ShabbatActive", isComponent: true]
+            )
+            log.info "Created ShabbatActive: ${child?.displayName}"
+        } catch (Exception e) {
+            log.error "Failed to create ShabbatActive switch: ${e.message}", e
+        }
+    } else {
+        log.debug "ShabbatActive virtual switch already exists."
+    }
+}
+
+private getActiveSwitch() {
+    return getChildDevice("shabbatactive-virtual-switch")
+}
