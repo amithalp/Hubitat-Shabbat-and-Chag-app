@@ -1,0 +1,103 @@
+# Shabbat and Holiday Schedules
+
+A Hubitat app that creates and manages a virtual **ShabbatActive** switch.  
+It automatically turns the switch **ON** at candle lighting and **OFF** at Havdalah, based on accurate times from [Hebcal](https://www.hebcal.com/).  
+Optionally, it can display upcoming event times on a dashboard tile using the **Notification Tile – enhanced** driver.
+
+---
+
+## ✨ Features
+
+- **Automatic switch control**
+  - Creates a virtual switch named **ShabbatActive** (if it doesn’t exist).
+  - Turns the switch ON at candle lighting and OFF at Havdalah.
+- **Data source**
+  - Fetches event times directly from Hebcal using your hub’s location and timezone.
+- **Flexible scheduling**
+  - Customizable polling frequency (default: every 24 hours).
+  - Adjustable Havdalah offset (minutes after sunset).
+- **Dashboard preview**
+  - Optional integration with the *Notification Tile – enhanced* driver.
+  - Displays upcoming Shabbat and Chag times in a dashboard tile.
+- **Lightweight design**
+  - Keeps only the **next** ON and OFF events scheduled at any given time.
+  - Automatically re-schedules the following events after each one fires.
+
+---
+
+## 📦 Requirements
+
+- A Hubitat Elevation hub with location and timezone correctly set.
+- Internet access for the hub (to fetch data from Hebcal).
+- (Optional) A virtual device using the **Notification Tile – enhanced** driver for dashboard display.
+
+---
+
+## ⚙️ Installation
+
+1. **Add the App Code**  
+   - In Hubitat, go to **Apps Code** → **New App**.
+   - Paste the code from this repository and save.
+
+2. **Install the App**  
+   - Go to **Apps** → **Add User App**.
+   - Select **Shabbat and Holiday Schedules**.
+
+3. **Configure Settings**  
+   - **Days ahead**: How many days of events to fetch from Hebcal.
+   - **Polling Frequency**: How often to refresh the schedule.
+   - **Havdalah Offset**: Minutes after sunset for Havdalah.
+   - (Optional) **Notification Tile**: Select a Notification Tile – enhanced device to display the schedule.
+   - Click **Done** to save.
+
+---
+
+## 🖥️ Dashboard Preview
+
+If a notification device is selected:
+- The app will send an HTML-formatted schedule to the `last5` attribute.
+- The tile supports up to 1024 characters.
+- Icons: 🕯️ for candle lighting, ✨ for Havdalah.
+
+---
+
+## 🔄 How Scheduling Works
+
+1. At installation or update:
+   - The app fetches events from Hebcal.
+   - Schedules **only** the next candle lighting and Havdalah using `runOnce()`.
+
+2. When an event runs (`shabbatOn` or `shabbatOff`):
+   - The switch state is updated.
+   - The app immediately polls again to schedule the next pair of events.
+
+This ensures schedules are always up-to-date and prevents overwriting with far-future events.
+
+---
+
+## 📜 Example Log Output
+
+info Next ON at Fri Aug 15 19:06:00 IDT 2025 (local Fri 15/08 19:06)
+info Next OFF at Sat Aug 16 20:14:00 IDT 2025 (local Sat 16/08 20:14)
+debug Preview length: 898
+
+
+---
+
+## 🛠️ Troubleshooting
+
+- **No events scheduled**  
+  Check that your Hubitat location and timezone are set correctly in **Settings → Location and Modes**.
+
+- **Tile not updating**  
+  Ensure the selected device supports the `capability.notification` and is running the **Notification Tile – enhanced** driver.
+
+- **Wrong times shown**  
+  Verify the **Havdalah Offset** matches your community’s practice (commonly 40–50 minutes after sunset).
+
+---
+
+## 📄 License
+
+This project is provided under the MIT License. See [LICENSE](LICENSE) for details.
+                                                      
